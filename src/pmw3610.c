@@ -1,3 +1,269 @@
+static int pmw3610_async_init_configure(const struct device *dev) {
+    LOG_INF("async_init_configure");
+
+    int err = 0;
+
+    // clear motion registers first (required in datasheet)
+    for (uint8_t reg = 0x02; (reg <= 0x05) && !err; reg++) {
+        uint8_t buf[1];
+        err = reg_read(dev, reg, buf);
+    }
+
+    // 黒色トラックボール対応のための追加設定
+    if (!err) {
+        // VCSEL（LED）制御レジスタの設定 - 強度を上げる
+        uint8_t vcsel_addr[] = {0x7F, PMW3610_REG_VCSEL_CTL, 0x7F};
+        uint8_t vcsel_data[] = {0xFF, 0xC0, 0x00}; // 最大強度に設定
+        err = burst_write(dev, vcsel_addr, vcsel_data, 3);
+        if (err) {
+            LOG_ERR("Failed to set VCSEL control");
+        } else {
+            LOG_INF("Enhanced LED intensity for dark surfaces");
+        }
+    }
+
+    // LSR制御レジスタの設定 - 暗い表面の検出を向上
+    if (!err) {
+        uint8_t lsr_addr[] = {0x7F, PMW3610_REG_LSR_CONTROL, 0x7F};
+        uint8_t lsr_data[] = {0xFF, 0x88, 0x00}; // 暗い表面用の感度設定
+        err = burst_write(dev, lsr_addr, lsr_data, 3);
+        if (err) {
+            LOG_ERR("Failed to set LSR control");
+        } else {
+            LOG_INF("Enhanced dark surface detection");
+        }
+    }
+
+    // cpi
+    if (!err) {
+        err = set_cpi(dev, CONFIG_PMW3610_CPI);
+    }
+
+    // set performace register: run mode, vel_rate, poshi_rate, poslo_rate
+    if (!err) {
+        err = reg_write(dev, PMW3610_REG_PERFORMANCE, PMW3610_PERFORMANCE_VALUE);
+        LOG_INF("Set performance register (reg value 0x%x)", PMW3610_PERFORMANCE_VALUE);
+    }
+
+    // 残りの既存の初期化コード...
+    // required downshift and rate registers
+    if (!err) {
+        err = set_downshift_time(dev, PMW3610_REG_RUN_DOWNSHIFT,
+                                 CONFIG_PMW3610_RUN_DOWNSHIFT_TIME_MS);
+    }
+    if (!err) {
+        err = set_sample_time(dev, PMW3610_REG_REST1_PERIOD, CONFIG_PMW3610_REST1_SAMPLE_TIME_MS);
+    }
+    if (!err) {
+        err = set_downshift_time(dev, PMW3610_REG_REST1_DOWNSHIFT,
+                                 CONFIG_PMW3610_REST1_DOWNSHIFT_TIME_MS);
+    }
+
+    // downshift time for each rest mode
+#if CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS > 0
+    if (!err) {
+        err = set_downshift_time(dev, PMW3610_REG_REST2_DOWNSHIFT,
+                                 CONFIG_PMW3610_REST2_DOWNSHIFT_TIME_MS);
+    }
+#endif
+#if CONFIG_PMW3610_REST2_SAMPLE_TIME_MS >= 10
+    if (!err) {
+        err = set_sample_time(dev, PMW3610_REG_REST2_PERIOD, CONFIG_PMW3610_REST2_SAMPLE_TIME_MS);
+    }
+#endif
+#if CONFIG_PMW3610_REST3_SAMPLE_TIME_MS >= 10
+    if (!err) {
+        err = set_sample_time(dev, PMW3610_REG_REST3_PERIOD, CONFIG_PMW3610_REST3_SAMPLE_TIME_MS);
+    }
+#endif
+    
+    // 黒色表面検出の初期設定
+    if (!err) {
+        // レジスタ0x32の初期設定 (スマートアルゴリズム用)
+        err = reg_write(dev, 0x32, 0x80);
+        if (!err) {
+            struct pixart_data *data = dev->data;
+            data->sw_smart_flag = true;
+            LOG_INF("Dark surface detection enabled");
+        }
+    }
+    
+    if (err) {
+        LOG_ERR("Config the sensor failed");
+        return err;
+    }
+
+    return 0;
+}static int pmw3610_report_data(const struct device *dev) {
+    struct pixart_data *data = dev->data;
+    uint8_t buf[PMW3610_BURST_SIZE];
+
+    if (unlikely(!data->ready)) {
+        LOG_WRN("Device is not initialized yet");
+        return -EBUSY;
+    }
+
+    int32_t dividor;
+    enum pixart_input_mode input_mode = get_input_mode_for_current_layer(dev);
+    bool input_mode_changed = data->curr_mode != input_mode;
+    switch (input_mode) {
+    case MOVE:
+        set_cpi_if_needed(dev, CONFIG_PMW3610_CPI);
+        dividor = CONFIG_PMW3610_CPI_DIVIDOR;
+        break;
+    case SCROLL:
+        set_cpi_if_needed(dev, CONFIG_PMW3610_CPI);
+        if (input_mode_changed) {
+            data->scroll_delta_x = 0;
+            data->scroll_delta_y = 0;
+        }
+        dividor = 1; // this should be handled with the ticks rather than dividors
+        break;
+    case SNIPE:
+        set_cpi_if_needed(dev, CONFIG_PMW3610_SNIPE_CPI);
+        dividor = CONFIG_PMW3610_SNIPE_CPI_DIVIDOR;
+        break;
+    default:
+        return -ENOTSUP;
+    }
+
+    data->curr_mode = input_mode;
+
+    int16_t x;
+    int16_t y;
+
+#if AUTOMOUSE_LAYER > 0
+    if (input_mode == MOVE &&
+         (automouse_triggered || zmk_keymap_highest_layer_active() != AUTOMOUSE_LAYER) &&
+            (abs(x) + abs(y) > CONFIG_PMW3610_MOVEMENT_THRESHOLD)
+) {
+    activate_automouse_layer();
+}
+#endif
+
+    int err = motion_burst_read(dev, buf, sizeof(buf));
+    if (err) {
+        return err;
+    }
+
+    int16_t raw_x =
+        TOINT16((buf[PMW3610_X_L_POS] + ((buf[PMW3610_XY_H_POS] & 0xF0) << 4)), 12) / dividor;
+    int16_t raw_y =
+        TOINT16((buf[PMW3610_Y_L_POS] + ((buf[PMW3610_XY_H_POS] & 0x0F) << 8)), 12) / dividor;
+    
+#ifdef CONFIG_PMW3610_ADJUSTABLE_MOUSESPEED
+    int16_t movement_size = abs(raw_x) + abs(raw_y);
+
+    float speed_multiplier = 1.0; //速度の倍率
+    if (movement_size > 60) {
+        speed_multiplier = 3.0;
+    }else if (movement_size > 30) {
+        speed_multiplier = 1.5;
+    }else if (movement_size > 5) {
+        speed_multiplier = 1.0;
+    }else if (movement_size > 4) {
+        speed_multiplier = 0.9;
+    }else if (movement_size > 3) {
+        speed_multiplier = 0.7;
+    }else if (movement_size > 2) {
+        speed_multiplier = 0.5;
+    }else if (movement_size > 1) {
+        speed_multiplier = 0.1;
+    }
+
+    raw_x = raw_x * speed_multiplier;
+    raw_y = raw_y * speed_multiplier;
+
+#endif
+
+    if (IS_ENABLED(CONFIG_PMW3610_ORIENTATION_0)) {
+        x = -raw_x;
+        y = raw_y;
+    } else if (IS_ENABLED(CONFIG_PMW3610_ORIENTATION_90)) {
+        x = raw_y;
+        y = -raw_x;
+    } else if (IS_ENABLED(CONFIG_PMW3610_ORIENTATION_180)) {
+        x = raw_x;
+        y = -raw_y;
+    } else if (IS_ENABLED(CONFIG_PMW3610_ORIENTATION_270)) {
+        x = -raw_y;
+        y = raw_x;
+    }
+
+    if (IS_ENABLED(CONFIG_PMW3610_INVERT_X)) {
+        x = -x;
+    }
+
+    if (IS_ENABLED(CONFIG_PMW3610_INVERT_Y)) {
+        y = -y;
+    }
+
+#ifdef CONFIG_PMW3610_SMART_ALGORITHM
+    int16_t shutter =
+        ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) + buf[PMW3610_SHUTTER_L_POS];
+    // 黒色表面のための閾値調整 - より低いシャッター値でも検出できるように
+    if (data->sw_smart_flag && shutter < 30) {  // 閾値を45から30に下げる
+        reg_write(dev, 0x32, 0x00);
+        data->sw_smart_flag = false;
+    }
+
+    if (!data->sw_smart_flag && shutter > 30) {  // 閾値を45から30に下げる
+        reg_write(dev, 0x32, 0x80);
+        data->sw_smart_flag = true;
+    }
+#endif
+
+#ifdef CONFIG_PMW3610_POLLING_RATE_125_SW
+    int64_t curr_time = k_uptime_get();
+    if (data->last_poll_time == 0 || curr_time - data->last_poll_time > 128) {
+        data->last_poll_time = curr_time;
+        data->last_x = x;
+        data->last_y = y;
+        return 0;
+    } else {
+        x += data->last_x;
+        y += data->last_y;
+        data->last_poll_time = 0;
+        data->last_x = 0;
+        data->last_y = 0;
+    }
+#endif
+
+    if (x != 0 || y != 0) {
+        if (input_mode != SCROLL) {
+#if AUTOMOUSE_LAYER > 0
+            // トラックボールの動きの大きさを計算
+            int16_t movement_size = abs(x) + abs(y);
+            if (input_mode == MOVE &&
+                (automouse_triggered || zmk_keymap_highest_layer_active() != AUTOMOUSE_LAYER) &&
+                movement_size > CONFIG_PMW3610_MOVEMENT_THRESHOLD) {
+                activate_automouse_layer();
+            }
+#endif
+            input_report_rel(dev, INPUT_REL_X, x, false, K_FOREVER);
+            input_report_rel(dev, INPUT_REL_Y, y, true, K_FOREVER);
+        } else {
+            data->scroll_delta_x += x;
+            data->scroll_delta_y += y;
+            if (abs(data->scroll_delta_y) > CONFIG_PMW3610_SCROLL_TICK) {
+                input_report_rel(dev, INPUT_REL_WHEEL,
+                                 data->scroll_delta_y > 0 ? PMW3610_SCROLL_Y_NEGATIVE : PMW3610_SCROLL_Y_POSITIVE,
+                                 true, K_FOREVER);
+                data->scroll_delta_x = 0;
+                data->scroll_delta_y = 0;
+            } else if (abs(data->scroll_delta_x) > CONFIG_PMW3610_SCROLL_TICK) {
+                input_report_rel(dev, INPUT_REL_HWHEEL,
+                                 data->scroll_delta_x > 0 ? PMW3610_SCROLL_X_NEGATIVE : PMW3610_SCROLL_X_POSITIVE,
+                                 true, K_FOREVER);
+                data->scroll_delta_x = 0;
+                data->scroll_delta_y = 0;
+            }
+        }
+    }
+
+    return err;
+}
+
 /*
  * Copyright (c) 2022 The ZMK Contributors
  *
@@ -469,6 +735,31 @@ static int pmw3610_async_init_configure(const struct device *dev) {
         err = reg_read(dev, reg, buf);
     }
 
+    // 黒色トラックボール対応のための追加設定
+    if (!err) {
+        // VCSEL（LED）制御レジスタの設定 - 強度を上げる
+        uint8_t vcsel_addr[] = {0x7F, PMW3610_REG_VCSEL_CTL, 0x7F};
+        uint8_t vcsel_data[] = {0xFF, 0xC0, 0x00}; // 最大強度に設定
+        err = burst_write(dev, vcsel_addr, vcsel_data, 3);
+        if (err) {
+            LOG_ERR("Failed to set VCSEL control");
+        } else {
+            LOG_INF("Enhanced LED intensity for dark surfaces");
+        }
+    }
+
+    // LSR制御レジスタの設定 - 暗い表面の検出を向上
+    if (!err) {
+        uint8_t lsr_addr[] = {0x7F, PMW3610_REG_LSR_CONTROL, 0x7F};
+        uint8_t lsr_data[] = {0xFF, 0x88, 0x00}; // 暗い表面用の感度設定
+        err = burst_write(dev, lsr_addr, lsr_data, 3);
+        if (err) {
+            LOG_ERR("Failed to set LSR control");
+        } else {
+            LOG_INF("Enhanced dark surface detection");
+        }
+    }
+
     // cpi
     if (!err) {
         err = set_cpi(dev, CONFIG_PMW3610_CPI);
@@ -510,6 +801,18 @@ static int pmw3610_async_init_configure(const struct device *dev) {
         err = set_sample_time(dev, PMW3610_REG_REST3_PERIOD, CONFIG_PMW3610_REST3_SAMPLE_TIME_MS);
     }
 #endif
+    
+    // 黒色表面検出の初期設定
+    if (!err) {
+        // レジスタ0x32の初期設定 (スマートアルゴリズム用)
+        err = reg_write(dev, 0x32, 0x80);
+        if (!err) {
+            struct pixart_data *data = dev->data;
+            data->sw_smart_flag = true;
+            LOG_INF("Dark surface detection enabled");
+        }
+    }
+    
     if (err) {
         LOG_ERR("Config the sensor failed");
         return err;
@@ -684,15 +987,14 @@ static int pmw3610_report_data(const struct device *dev) {
 #ifdef CONFIG_PMW3610_SMART_ALGORITHM
     int16_t shutter =
         ((int16_t)(buf[PMW3610_SHUTTER_H_POS] & 0x01) << 8) + buf[PMW3610_SHUTTER_L_POS];
-    if (data->sw_smart_flag && shutter < 45) {
+    // 黒色表面のための閾値調整 - より低いシャッター値でも検出できるように
+    if (data->sw_smart_flag && shutter < 30) {  // 閾値を45から30に下げる
         reg_write(dev, 0x32, 0x00);
-
         data->sw_smart_flag = false;
     }
 
-    if (!data->sw_smart_flag && shutter > 45) {
+    if (!data->sw_smart_flag && shutter > 30) {  // 閾値を45から30に下げる
         reg_write(dev, 0x32, 0x80);
-
         data->sw_smart_flag = true;
     }
 #endif
